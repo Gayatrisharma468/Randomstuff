@@ -1,0 +1,78 @@
+DECLARE table_exists BOOL DEFAULT FALSE;
+DECLARE error_occurred BOOL DEFAULT FALSE;
+
+BEGIN
+  -- Check if the table exists
+  SET table_exists = (SELECT COUNT(1) > 0 
+                      FROM `region-us.INFORMATION_SCHEMA.TABLES` 
+                      WHERE table_schema = @WORK_DB 
+                      AND table_name = CONCAT(@BUS_SEG, '_WLS_TBLT_CHURN_DDM'));
+
+  -- Drop table if it exists
+  IF table_exists THEN
+    EXECUTE IMMEDIATE FORMAT("""
+      DROP TABLE `%s.%s_WLS_TBLT_CHURN_DDM`
+    """, @WORK_DB, @BUS_SEG);
+  END IF;
+
+EXCEPTION WHEN ERROR THEN
+  SET error_occurred = TRUE;
+END;
+
+-- Exit with error if any failure occurs
+IF error_occurred THEN 
+  RAISE USING MESSAGE = "Error occurred", ERROR_CODE = 99;
+END IF;
+
+-- step 1: device map
+DECLARE error_occurred BOOL DEFAULT FALSE;
+
+BEGIN
+  -- Step 1: Create Table with Clustering (Since BigQuery Doesn't Have Indexes)
+  CREATE OR REPLACE TABLE `${WORK_DB}.${BUS_SEG}_WLS_TBLT_CHURN_DDM`
+  CLUSTER BY prod_nm, device_nm AS 
+  (
+    SELECT 
+      prod_nm,
+      data_tier_fin AS data_tier,
+      CASE
+        WHEN device_grouping = 'Tablet' THEN 'Tablet'
+        WHEN device_grouping = 'Wearable Devices' THEN 
+          CASE WHEN mfg_nm = 'Apple' THEN 'Apple Watch' ELSE 'Android Watch' END
+        WHEN device_grouping = 'Apple' THEN 'iPhone'
+        WHEN data_tier_fin = 'Smartphone' THEN 'Other Smart'
+        WHEN data_tier_fin = 'Internet' THEN 'MBB'
+        WHEN device_grouping = 'Android' THEN 'Android Phone'
+        ELSE data_tier_fin
+      END AS device_grp,
+      
+      CASE
+        WHEN mfg_nm = 'Apple' THEN device_brand_nm
+        WHEN mfg_nm IN ('Samsung', 'QUANTA') AND device_grouping IN ('Android', 'Tablet', 'Wearable Devices') THEN device_brand_nm
+        WHEN device_grouping = 'Android' THEN 'Other Android Phone'
+        ELSE device_grp
+      END AS device_nm,
+
+      CASE
+        WHEN device_grouping = 'Tablet' THEN 'Other Android Tablet'
+        WHEN mfg_nm = 'Apple' THEN 'iOS'
+        WHEN os_type_fin LIKE 'Win%' OR os_type_fin LIKE 'Microsoft%' THEN 'Windows'
+        WHEN device_grouping = 'Tablet' THEN 'Android'
+        ELSE os_type_fin
+      END AS os_type,
+
+      mfg_nm,
+      device_generation
+    FROM `vz-it-pr-gklv-cwlspr-0.vzw_uda_prd_tbls.device_dp_map`
+    WHERE device_grouping = 'Tablet'
+  );
+
+EXCEPTION WHEN ERROR THEN
+  SET error_occurred = TRUE;
+END;
+
+-- Step 2: Error Handling (BigQuery Doesn't Support "COLLECT STATISTICS")
+IF error_occurred THEN 
+  RAISE USING MESSAGE = "Error occurred while creating table.", ERROR_CODE = 99;
+END IF;
+
